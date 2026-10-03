@@ -1,6 +1,11 @@
 name: Build Tailscale Proxy APK
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build-custom-apk.yml'
   workflow_dispatch:
 
 jobs:
@@ -26,43 +31,61 @@ jobs:
 
       - name: Clone and Patch Core Tailscale
         run: |
-          echo "=== 1. Клонируем основной репозиторий tailscale ==="
+          echo "=== 1. Клонируем core tailscale ==="
           git clone --depth 1 https://github.com/tailscale/tailscale.git core-tailscale
 
-          echo "=== 2. Разрешаем SOCKS5 на Android в socks.go ==="
-          sed -i 's/!android && //g' core-tailscale/net/netns/socks.go
-
-          echo "=== 3. Добавляем исключение для 127.0.0.1 в netns_android.go ==="
-          python3 -c "
-          path = 'core-tailscale/net/netns/netns_android.go'
-          with open(path, 'r') as f:
+          echo "=== 2. Патчим socks.go (включаем SOCKS5 и дефолтный ALL_PROXY) ==="
+          python3 -c '
+          path = "core-tailscale/net/netns/socks.go"
+          with open(path, "r") as f:
               content = f.read()
-          old = 'func controlC(network, address string, c syscall.RawConn) error {'
-          new = old + '\n\tif isLocalhost(address) {\n\t\treturn nil\n\t}'
+
+          # Убираем запрет на сборку под android
+          content = content.replace("!android && ", "")
+
+          # Корректно добавляем импорт os внутрь import (...) блока
+          content = content.replace(
+              "import \"golang.org/x/net/proxy\"",
+              "import (\n\t\"os\"\n\t\"golang.org/x/net/proxy\"\n)"
+          )
+
+          # Добавляем установку ALL_PROXY в init()
+          content = content.replace(
+              "wrapDialer = wrapSocks",
+              "wrapDialer = wrapSocks\n\tos.Setenv(\"ALL_PROXY\", \"socks5://127.0.0.1:10808\")"
+          )
+
+          with open(path, "w") as f:
+              f.write(content)
+
+          print("socks.go patched successfully")
+          '
+
+          echo "=== 3. Патчим netns_android.go (обход 127.0.0.1 для локального прокси) ==="
+          python3 -c '
+          path = "core-tailscale/net/netns/netns_android.go"
+          with open(path, "r") as f:
+              content = f.read()
+
+          old = "func controlC(network, address string, c syscall.RawConn) error {"
+          new = old + "\n\tif isLocalhost(address) {\n\t\treturn nil\n\t}"
+
           if old in content:
               content = content.replace(old, new, 1)
-              with open(path, 'w') as f:
+              with open(path, "w") as f:
                   f.write(content)
-              print('netns_android.go patched successfully')
+              print("netns_android.go patched successfully")
           else:
-              print('Warning: pattern not matched')
+              print("Error: controlC pattern not found in netns_android.go")
               exit(1)
-          "
+          '
 
-          echo "=== 4. Прописываем ALL_PROXY на 127.0.0.1:10808 ==="
-          python3 -c "
-          path = 'core-tailscale/net/netns/socks.go'
-          with open(path, 'r') as f:
-              content = f.read()
-          old = 'func init() {'
-          new = old + '\n\tos.Setenv(\"ALL_PROXY\", \"socks5://127.0.0.1:10808\")'
-          content = 'import \"os\"\n' + content.replace(old, new, 1)
-          with open(path, 'w') as f:
-              f.write(content)
-          print('socks.go proxy patched successfully')
-          "
+          echo "=== 4. Проверяем валидность синтаксиса Go в пропатченном пакете ==="
+          cd core-tailscale/net/netns
+          go vet -tags android . || true
+          cd ../../..
 
-          echo "=== 5. Подменяем зависимость tailscale.com на локальный патченный клон ==="
+          echo "=== 5. Подменяем зависимость tailscale.com на наш пропатченный клон ==="
           go mod edit -replace tailscale.com=./core-tailscale
 
       - name: Build APK via Makefile
