@@ -1,0 +1,84 @@
+name: Build Tailscale Proxy APK
+
+on:
+  workflow_dispatch: # Запуск вручную по кнопке
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26b
+
+      # Шаг с внесением ключевых правок для поддержки локального SOCKS5
+      - name: Apply Proxy Patches
+        run: |
+          echo "=== 1. Разрешаем SOCKS5-прокси на Android ==="
+          sed -i 's/!android && //g' tailscale/net/netns/socks.go
+
+          echo "=== 2. Добавляем исключение для localhost в netns_android.go ==="
+          # Вставляем проверку isLocalhost(address), чтобы сокеты к 127.0.0.1 не блокировались
+          python3 -c "
+          path = 'tailscale/net/netns/netns_android.go'
+          with open(path, 'r') as f:
+              content = f.read()
+          old = 'func controlC(network, address string, c syscall.RawConn) error {'
+          new = old + '\n\tif isLocalhost(address) {\n\t\treturn nil\n\t}'
+          if old in content:
+              content = content.replace(old, new, 1)
+              with open(path, 'w') as f:
+                  f.write(content)
+              print('netns_android.go successfully patched')
+          else:
+              print('Pattern not found!')
+              exit(1)
+          "
+
+          echo "=== 3. Задаем дефолтный ALL_PROXY на localhost:10808 ==="
+          # Добавляем установку ALL_PROXY в инициализацию пакета netns
+          python3 -c "
+          path = 'tailscale/net/netns/socks.go'
+          with open(path, 'r') as f:
+              content = f.read()
+          old = 'func init() {'
+          new = old + '\n\tos.Setenv(\"ALL_PROXY\", \"socks5://127.0.0.1:10808\")'
+          content = 'import \"os\"\n' + content.replace(old, new, 1)
+          with open(path, 'w') as f:
+              f.write(content)
+          print('socks.go proxy default patched')
+          "
+
+          git diff tailscale/net/netns/
+
+      - name: Build APK with Gradle
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale-proxy-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 7
